@@ -1,5 +1,6 @@
 import express from 'express';
 import { appointments, assignTask, blocks, containerDetail, containers, createContainer, createGateAppointment, createYardTask, dashboard, deleteContainer, deleteGateAppointment, deleteYardTask, editGateAppointment, equipment, gateConflicts, prioritizeTasks, tasks, updateContainer, updateYardTask, voyages, yardHeatmap } from './domain.js';
+import { acknowledgeAlarm, dispatchAlarm, escalateAlarm, ingestSample, markAlarmRead, markAllAlarmsRead, recoverAlarm, reeferOverview, suppressAlarm, updateThreshold } from './reefer.js';
 const app = express(); app.use(express.json());
 app.get('/api/dashboard', (_req, res) => res.json(dashboard()));
 app.get('/api/voyages', (_req, res) => res.json(voyages));
@@ -21,5 +22,19 @@ app.post('/api/tasks', (req, res) => { try { res.status(201).json(createYardTask
 app.patch('/api/tasks/:id', (req, res) => { try { const result = updateYardTask(req.params.id, req.body); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '更新作业任务失败' }); } });
 app.delete('/api/tasks/:id', (req, res) => { const result = deleteYardTask(req.params.id); if (!result) return res.status(404).json({ message: '作业任务不存在' }); res.json({ deleted: true, id: result.id }); });
 app.patch('/api/tasks/:id/assign', (req, res) => { const result = assignTask(req.params.id, req.body.equipmentId); if (!result) return res.status(404).json({ message: '任务或设备不存在' }); res.json(result); });
+app.get('/api/reefer/overview', (_req, res) => res.json(reeferOverview()));
+app.post('/api/reefer/samples', (req, res) => { try { res.status(201).json(ingestSample(req.body)); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '采样接入失败' }); } });
+app.post('/api/reefer/alarms/read-all', (_req, res) => res.json(markAllAlarmsRead()));
+const alarmAction = (action: (id: string, body: Record<string, unknown>) => unknown, failMessage: string) => (req: express.Request<{ id: string }>, res: express.Response) => {
+  try { const result = action(req.params.id, req.body ?? {}); if (!result) return res.status(404).json({ message: '告警不存在' }); res.json(result); }
+  catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : failMessage }); }
+};
+app.post('/api/reefer/alarms/:id/ack', alarmAction((id, body) => acknowledgeAlarm(id, String(body.actor ?? '值班员')), '确认告警失败'));
+app.post('/api/reefer/alarms/:id/escalate', alarmAction((id, body) => escalateAlarm(id, String(body.actor ?? '值班员')), '升级告警失败'));
+app.post('/api/reefer/alarms/:id/suppress', alarmAction((id, body) => suppressAlarm(id, Number(body.minutes ?? 30), String(body.actor ?? '值班员'), body.note ? String(body.note) : ''), '抑制告警失败'));
+app.post('/api/reefer/alarms/:id/recover', alarmAction((id, body) => recoverAlarm(id, String(body.actor ?? '值班员')), '恢复闭环失败'));
+app.post('/api/reefer/alarms/:id/read', alarmAction(id => markAlarmRead(id), '标记已读失败'));
+app.post('/api/reefer/alarms/:id/dispatch', alarmAction((id, body) => dispatchAlarm(id, body.mode === 'manual' ? 'manual' : 'task', String(body.actor ?? '值班员'), body.action ? String(body.action) : undefined), '处置派发失败'));
+app.put('/api/reefer/thresholds/:stage', (req, res) => { try { const result = updateThreshold(req.params.stage as Parameters<typeof updateThreshold>[0], req.body ?? {}, String(req.body?.actor ?? '值班员')); if (!result) return res.status(404).json({ message: '阈值规则不存在' }); res.json(result); } catch (error) { res.status(409).json({ message: error instanceof Error ? error.message : '阈值更新失败' }); } });
 app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'port-yard-operations' }));
 const port = Number(process.env.PORT || 4107); app.listen(port, () => console.log(`port yard API listening on ${port}`));

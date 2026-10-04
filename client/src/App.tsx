@@ -8,12 +8,24 @@ type Conflict = { severity: string; appointmentId: string; reason: string };
 type Appointment = { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup'|'dropoff'; windowStart: string; windowEnd: string; lane: 'north'|'south'|'rail'; status: string; exception?: string };
 type Task = { id: string; kind: string; containerId: string; from: string; to: string; equipmentId?: string; priority: number; score: number; status: string; blockingReasons: string[]; estimatedMinutes: number; scheduledAt: string };
 type Equipment = { id: string; name: string; kind: string; status: string; location: string; battery: number; queue: number; movesPerHour: number };
-type Section = 'control'|'containers'|'gate'|'yard'|'tasks';
+type ReeferReading = { sampleId: string; temperature: number; power: string; sampledAt: string; deviceId: string };
+type ReeferAlarm = { id: string; containerId: string; stage: string; category: string; level: 'warning'|'critical'; status: string; reason: string; advice: string; reading: ReeferReading; openedAt: string; lastSeenAt: string; hitCount: number; suppressedHits: number; escalateCount: number; acknowledgedBy?: string; acknowledgedAt?: string; suppressedUntil?: string; recoveredAt?: string; recoverySampleId?: string; dispatchTaskId?: string; handlingRecordId?: string; thresholdNote?: string; unread: boolean };
+type ReeferDevice = { id: string; name: string; blockId: string; lastSeenAt: string; offline: boolean };
+type ThresholdRule = { stage: string; warnDelta: number; critDelta: number; updatedAt: string; updatedBy: string };
+type HandlingRecord = { id: string; alarmId: string; containerId: string; action: string; actor: string; at: string; result: string };
+type ReeferMonitor = { container: Container; stage: string; setpoint: number; latest?: { id: string; temperature: number; power: string; sampledAt: string; deviceId: string; flags: string[] } };
+type ReeferOverview = { alarms: ReeferAlarm[]; unreadCount: number; activeCount: number; suppressedCount: number; devices: ReeferDevice[]; thresholds: ThresholdRule[]; handlingRecords: HandlingRecord[]; monitors: ReeferMonitor[]; sampleCount: number };
+type Section = 'control'|'containers'|'gate'|'yard'|'tasks'|'reefer';
 type Editor = { entity: 'container'|'appointment'|'task'; mode: 'create'|'edit'; id?: string; values: Record<string, string|boolean> };
 
 const api = '/api';
 const pct = (value: number) => `${Math.round(value * 100)}%`;
 const time = (value: string) => new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const stageLabel: Record<string, string> = { 'in-yard': '堆场', inspection: '查验区', 'at-gate': '待闸口', 'on-quay': '船边', 'in-transit': '在途' };
+const powerLabel: Record<string, string> = { connected: '市电', unplugged: '已断电', battery: '电池', offline: '离线' };
+const categoryLabel: Record<string, string> = { temperature: '温度越限', power: '电源异常', 'device-offline': '设备离线' };
+const alarmStatusLabel: Record<string, string> = { open: '待确认', acknowledged: '已确认', escalated: '已升级', suppressed: '抑制中', recovered: '已闭环' };
+const flagLabel: Record<string, string> = { 'clock-drift': '时钟漂移', 'stale-sample': '过期采样' };
 const toLocalInput = (value?: string) => {
   const date = value ? new Date(value) : new Date(Date.now() + 30 * 60000);
   return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
@@ -40,22 +52,35 @@ export default function App() {
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [equipment, setEquipment] = useState<Equipment[]>([]);
+  const [reefer, setReefer] = useState<ReeferOverview>();
   const [tab, setTab] = useState<Section>('control');
   const [selectedVoyage, setSelectedVoyage] = useState('VOY-AX7');
   const [editor, setEditor] = useState<Editor>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [sampleForm, setSampleForm] = useState({ containerId: '', temperature: '4', sampledAt: toLocalInput(), power: 'connected', deviceId: 'RDU-B07-01' });
+  const [thresholdDraft, setThresholdDraft] = useState<Record<string, { warnDelta: string; critDelta: string }>>({});
 
   const load = useCallback(async () => {
-    const [d, v, ctn, b, cf, a, t, e] = await Promise.all([
+    const [d, v, ctn, b, cf, a, t, e, r] = await Promise.all([
       request<Dashboard>('/dashboard'), request<Voyage[]>('/voyages'), request<Container[]>('/containers'),
       request<Block[]>('/yard/heatmap'), request<Conflict[]>('/gate/conflicts'), request<Appointment[]>('/gate/appointments'),
-      request<Task[]>('/tasks'), request<Equipment[]>('/equipment')
+      request<Task[]>('/tasks'), request<Equipment[]>('/equipment'), request<ReeferOverview>('/reefer/overview')
     ]);
-    setDashboard(d); setVoyages(v); setContainers(ctn); setBlocks(b); setConflicts(cf); setAppointments(a); setTasks(t); setEquipment(e);
+    setDashboard(d); setVoyages(v); setContainers(ctn); setBlocks(b); setConflicts(cf); setAppointments(a); setTasks(t); setEquipment(e); setReefer(r);
   }, []);
   useEffect(() => { void load().catch(reason => setError(reason instanceof Error ? reason.message : '无法连接服务端')); }, [load]);
+  // 冷藏告警页驻留时每 30 秒轮询，未读状态由服务端保存，刷新页面不丢失
+  useEffect(() => {
+    if (tab !== 'reefer') return;
+    const timer = setInterval(() => { void load().catch(() => undefined); }, 30000);
+    return () => clearInterval(timer);
+  }, [tab, load]);
+  useEffect(() => {
+    if (!reefer) return;
+    setThresholdDraft(current => Object.keys(current).length ? current : Object.fromEntries(reefer.thresholds.map(rule => [rule.stage, { warnDelta: String(rule.warnDelta), critDelta: String(rule.critDelta) }])));
+  }, [reefer]);
 
   const mutate = async (path: string, method: string, body?: unknown) => {
     setBusy(true); setError('');
@@ -93,6 +118,34 @@ export default function App() {
   };
   const updateAppointmentStatus = async (id: string, status: string) => mutate(`/gate/appointments/${id}`, 'PATCH', { status });
   const assign = async (id: string, equipmentId: string) => equipmentId ? mutate(`/tasks/${id}/assign`, 'PATCH', { equipmentId }) : mutate(`/tasks/${id}`, 'PATCH', { equipmentId: '', status: 'queued' });
+  const submitSample = async (event: FormEvent) => {
+    event.preventDefault(); setBusy(true); setError('');
+    try {
+      const result = await request<{ duplicate: boolean; evaluation: unknown; sample: { flags: string[] } }>('/reefer/samples', { method: 'POST', body: JSON.stringify({ ...sampleForm, temperature: Number(sampleForm.temperature), sampledAt: new Date(sampleForm.sampledAt).toISOString() }) });
+      await load();
+      setMessage(result.duplicate ? '重复采样已幂等忽略，未产生新告警'
+        : result.sample.flags.includes('clock-drift') ? '采样已记录：检测到设备时钟漂移，已标记并审计'
+        : result.sample.flags.includes('stale-sample') ? '采样时间过旧，已归档但不参与告警判定'
+        : result.evaluation ? '采样已接收，触发/刷新告警判定'
+        : '采样正常，满足条件的告警已自动恢复闭环');
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '采样接入失败'); }
+    finally { setBusy(false); }
+  };
+  const suppressAlarm = async (alarm: ReeferAlarm) => {
+    const input = window.prompt('抑制时长（分钟，5–240）；抑制期内重复异常只计数不打扰', '30');
+    if (input === null) return;
+    await mutate(`/reefer/alarms/${alarm.id}/suppress`, 'POST', { minutes: Number(input), actor: '值班员' });
+  };
+  const dispatchAlarm = async (alarm: ReeferAlarm, mode: 'task' | 'manual') => {
+    const action = mode === 'manual' ? window.prompt('记录人工处置措施', alarm.advice) : undefined;
+    if (mode === 'manual' && action === null) return;
+    await mutate(`/reefer/alarms/${alarm.id}/dispatch`, 'POST', { mode, actor: '值班员', ...(action ? { action } : {}) });
+  };
+  const saveThreshold = async (stage: string) => {
+    const draft = thresholdDraft[stage];
+    if (!draft) return;
+    await mutate(`/reefer/thresholds/${stage}`, 'PUT', { warnDelta: Number(draft.warnDelta), critDelta: Number(draft.critDelta), actor: '值班员' });
+  };
   const selected = voyages.find(voyage => voyage.id === selectedVoyage);
   const remaining = selected ? selected.movesPlanned - selected.movesDone : 0;
   const maxHeat = useMemo(() => Math.max(...blocks.map(block => block.heat), 1), [blocks]);
@@ -104,8 +157,79 @@ export default function App() {
     <header><div><div className="eyebrow">PORT OPS / YARD & GATE CONTROL</div><h1>HarborGrid <span>港口集装箱堆场协同与闸口调度</span></h1><p>把船期、箱务、堆场容量、危险品/冷藏约束、闸口预约与场内设备任务放在同一条作业链路上。</p></div><div className="header-right"><span className="live"><i/> TOS LINKED</span><span className="clock">LIVE · {new Date().toLocaleTimeString()}</span></div></header>
     {message && <div className="toast" onClick={() => setMessage('')}>{message} ×</div>}{error && <div className="form-error page-error">{error}<button onClick={() => setError('')}>关闭</button></div>}
     <section className="kpis"><div><small>ACTIVE VESSELS</small><b>{dashboard.activeVoyages}<em> 艘</em></b><span>{dashboard.lateVessels} 艘存在延误风险</span></div><div><small>YARD UTILIZATION</small><b>{pct(dashboard.yardUtilization)}</b><span>可用堆位 / 危险品隔离纳管</span></div><div><small>GATE QUEUE</small><b>{dashboard.gateQueue}<em> 车</em></b><span>预约、已进场与车道排队</span></div><div><small>EXCEPTIONS</small><b>{dashboard.blockedTasks + dashboard.reeferAlerts + dashboard.hazmatHolds}<em> 项</em></b><span>{dashboard.blockedTasks} 作业阻塞 · {dashboard.reeferAlerts} 冷藏告警</span></div></section>
-    <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
+    <nav className="tabs"><button className={tab==='control'?'active':''} onClick={() => setTab('control')}>作业驾驶舱</button><button className={tab==='reefer'?'active':''} onClick={() => setTab('reefer')}>冷藏监控告警{reefer && reefer.unreadCount > 0 ? ` · ${reefer.unreadCount} 未读` : ''}</button><button className={tab==='containers'?'active':''} onClick={() => setTab('containers')}>箱务台账 / CRUD</button><button className={tab==='gate'?'active':''} onClick={() => setTab('gate')}>闸口预约</button><button className={tab==='yard'?'active':''} onClick={() => setTab('yard')}>堆场热区</button><button className={tab==='tasks'?'active':''} onClick={() => setTab('tasks')}>设备任务</button><span>最后同步 {new Date().toLocaleTimeString()}</span></nav>
     {tab === 'control' && <div className="layout"><section className="panel vessel-panel"><div className="panel-head"><div><div className="eyebrow">VESSEL WINDOW / 船期窗口</div><h2>泊位作业进度</h2></div><span className="muted">剩余作业动态计算</span></div>{voyages.map(voyage => <button key={voyage.id} className={`vessel ${selectedVoyage===voyage.id?'selected':''}`} onClick={() => setSelectedVoyage(voyage.id)}><span className={`vessel-dot ${voyage.status}`}/><span className="vessel-main"><b>{voyage.vessel}</b><small>{voyage.id} · {voyage.service} · {voyage.berth}</small><i><em style={{ width: `${Math.min(100, voyage.movesDone / voyage.movesPlanned * 100)}%` }}/></i></span><span className="vessel-move"><b>{voyage.movesDone.toLocaleString()}</b><small>/ {voyage.movesPlanned.toLocaleString()} moves</small></span><strong className={voyage.lateRisk}>{voyage.lateRisk==='high'?'HIGH':voyage.lateRisk==='medium'?'WATCH':'ON TIME'}</strong></button>)}</section><section className="panel focus-panel"><div className="panel-head"><div><div className="eyebrow">SELECTED VOYAGE / {selected?.id}</div><h2>{selected?.vessel}</h2></div><span className={`badge ${selected?.lateRisk}`}>{selected?.status}</span></div><div className="voyage-stats"><div><small>ETA</small><b>{selected&&time(selected.eta)}</b><span>预计靠泊</span></div><div><small>ETD</small><b>{selected&&time(selected.etd)}</b><span>计划离港</span></div><div><small>REMAINING</small><b>{remaining}</b><span>剩余翻箱</span></div></div><div className="berth-map"><div className="water"><span>岸线 / BERTH</span><i className="ship" style={{ left: `${selected?.berth==='B07'?50:24}%` }}>{selected?.vessel}</i><b>B01</b><b>B04</b><b>B07</b><b>B10</b></div></div><div className="callout"><strong>调度策略</strong><span>已把 {dashboard.blockedTasks} 个阻塞任务、{dashboard.gateQueue} 车闸口压力纳入当前窗口；优先保护冷藏与危险品安全约束。</span></div></section><section className="panel wide"><div className="panel-head"><h3>异常与联动信号</h3><span>{conflicts.length} gate conflicts detected</span></div><div className="signal-grid"><div><strong className="critical">{dashboard.blockedTasks}</strong><span>设备/约束阻塞</span><small>最高优先级：海关查验任务</small></div><div><strong className="warning">{conflicts.length}</strong><span>闸口预约冲突</span><small>同车重叠窗口需人工重排</small></div><div><strong className="warning">{dashboard.reeferAlerts}</strong><span>冷藏与温控风险</span><small>查验区电源余量接近阈值</small></div><div><strong className="ok">{equipment.filter(item => item.status==='available').length}</strong><span>可调度设备</span><small>场桥 / 正面吊 / 集卡</small></div></div></section></div>}
+    {tab === 'reefer' && reefer && <div className="layout">
+      <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">REEFER ALARM CENTER / 冷藏监控与告警中心</div><h2>告警处置台</h2><span className="muted">确认、升级、抑制、恢复闭环与处置派发在同一处完成；未读状态保存在服务端，刷新不丢失</span></div><div className="row-actions"><button onClick={() => void mutate('/reefer/alarms/read-all', 'POST')}>全部已读</button><button onClick={() => void load()}>刷新</button></div></div>
+        <div className="reefer-kpis"><div><small>活跃告警</small><b>{reefer.activeCount}</b></div><div><small>未读</small><b className={reefer.unreadCount?'critical':''}>{reefer.unreadCount}</b></div><div><small>抑制中</small><b>{reefer.suppressedCount}</b></div><div><small>离线设备</small><b className={reefer.devices.some(d=>d.offline)?'warning':''}>{reefer.devices.filter(d=>d.offline).length}</b></div><div><small>累计采样</small><b>{reefer.sampleCount}</b></div></div>
+        {reefer.alarms.length === 0 && <p className="muted">当前没有告警记录</p>}
+        {reefer.alarms.map(alarm => <div className={`alarm ${alarm.level} ${alarm.status}${alarm.unread?' unread':''}`} key={alarm.id}>
+          <div className="alarm-top">
+            {alarm.unread && <i className="unread-dot" title="未读"/>}
+            <span className={`level-badge ${alarm.level}`}>{alarm.level==='critical'?'严重':'警告'}</span>
+            <b>{alarm.containerId}</b>
+            <span className="pill stage">{stageLabel[alarm.stage] ?? alarm.stage}</span>
+            <span className="muted">{categoryLabel[alarm.category] ?? alarm.category}</span>
+            <span className={`pill ${alarm.status}`}>{alarmStatusLabel[alarm.status] ?? alarm.status}</span>
+            <span className="alarm-time">触发 {time(alarm.openedAt)} · 最近 {time(alarm.lastSeenAt)}</span>
+          </div>
+          <div className="alarm-reason">{alarm.reason}{alarm.hitCount>1 && <em>（重复 {alarm.hitCount} 次）</em>}{alarm.suppressedHits>0 && <em>（抑制期内命中 {alarm.suppressedHits} 次）</em>}{alarm.escalateCount>0 && <em>（已升级 {alarm.escalateCount} 次）</em>}</div>
+          <div className="alarm-reading">原始读数（只读）：{alarm.reading.temperature}°C · {powerLabel[alarm.reading.power] ?? alarm.reading.power} · 采样 {time(alarm.reading.sampledAt)} · {alarm.reading.deviceId}</div>
+          <div className="alarm-advice">处置建议：{alarm.advice}</div>
+          {alarm.thresholdNote && <div className="alarm-note">{alarm.thresholdNote}</div>}
+          {alarm.acknowledgedBy && <div className="alarm-note">已由 {alarm.acknowledgedBy} 确认{alarm.acknowledgedAt ? ` ${time(alarm.acknowledgedAt)}` : ''}</div>}
+          {alarm.status==='suppressed' && alarm.suppressedUntil && <div className="alarm-note">抑制至 {time(alarm.suppressedUntil)}，期间重复异常只计数</div>}
+          {alarm.status==='recovered' && <div className="alarm-note ok-text">已闭环 {alarm.recoveredAt ? time(alarm.recoveredAt) : ''} · 依据正常采样 {alarm.recoverySampleId}</div>}
+          {alarm.dispatchTaskId && <div className="alarm-note">已派场内任务 {alarm.dispatchTaskId}</div>}
+          {alarm.handlingRecordId && <div className="alarm-note">人工处置单 {alarm.handlingRecordId}</div>}
+          <div className="alarm-actions">
+            {alarm.status!=='recovered' && alarm.status!=='suppressed' && <>
+              {!alarm.acknowledgedBy && <button onClick={() => void mutate(`/reefer/alarms/${alarm.id}/ack`, 'POST', { actor: '值班员' })}>确认</button>}
+              <button onClick={() => void mutate(`/reefer/alarms/${alarm.id}/escalate`, 'POST', { actor: '值班员' })}>升级</button>
+              <button onClick={() => void suppressAlarm(alarm)}>抑制重复</button>
+              <button onClick={() => void mutate(`/reefer/alarms/${alarm.id}/recover`, 'POST', { actor: '值班员' })}>恢复闭环</button>
+              <button className="primary-action" onClick={() => void dispatchAlarm(alarm, 'task')}>转场内任务</button>
+              <button onClick={() => void dispatchAlarm(alarm, 'manual')}>人工处置记录</button>
+            </>}
+            {alarm.status==='suppressed' && <button onClick={() => void mutate(`/reefer/alarms/${alarm.id}/recover`, 'POST', { actor: '值班员' })}>凭新采样确认恢复</button>}
+            {alarm.unread && <button onClick={() => void mutate(`/reefer/alarms/${alarm.id}/read`, 'POST')}>标记已读</button>}
+          </div>
+        </div>)}
+      </section>
+      <section className="panel"><div className="panel-head"><div><div className="eyebrow">TELEMETRY INGEST / 采样接入</div><h2>冷藏遥测采样</h2></div></div>
+        <form className="form-grid single" onSubmit={submitSample}>
+          <label>箱号<select required value={sampleForm.containerId} onChange={event => setSampleForm({ ...sampleForm, containerId: event.target.value })}><option value="">选择冷藏箱</option>{reefer.monitors.map(monitor => <option key={monitor.container.id} value={monitor.container.id}>{monitor.container.id} · {stageLabel[monitor.stage]}</option>)}</select></label>
+          <label>温度 (°C)<input type="number" step="0.1" required value={sampleForm.temperature} onChange={event => setSampleForm({ ...sampleForm, temperature: event.target.value })}/></label>
+          <label>采样时间<input type="datetime-local" required value={sampleForm.sampledAt} onChange={event => setSampleForm({ ...sampleForm, sampledAt: event.target.value })}/></label>
+          <label>电源状态<select value={sampleForm.power} onChange={event => setSampleForm({ ...sampleForm, power: event.target.value })}>{Object.entries(powerLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+          <label>来源设备<select value={sampleForm.deviceId} onChange={event => setSampleForm({ ...sampleForm, deviceId: event.target.value })}>{reefer.devices.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
+          <button className="primary-action" disabled={busy}>{busy?'上报中…':'上报采样'}</button>
+        </form>
+        <p className="muted form-hint">同箱同设备同时间的重复采样幂等忽略；时钟超前 5 分钟标记漂移；超过 30 分钟的旧采样只归档不参与判定。</p>
+      </section>
+      <section className="panel"><div className="panel-head"><div><div className="eyebrow">REEFER MONITOR / 现场读数</div><h2>冷藏箱实时监控</h2></div><span className="muted">{reefer.monitors.length} 冷藏箱</span></div>
+        {reefer.monitors.map(monitor => <div className="monitor" key={monitor.container.id}>
+          <div className="monitor-top"><b>{monitor.container.id}</b><span className="pill stage">{stageLabel[monitor.stage]}</span></div>
+          <div className="monitor-grid"><span>设定 {monitor.setpoint}°C</span><span>最新 {monitor.latest ? `${monitor.latest.temperature}°C` : '无采样'}</span><span>{monitor.latest ? (powerLabel[monitor.latest.power] ?? monitor.latest.power) : '—'}</span><span>{monitor.latest ? time(monitor.latest.sampledAt) : ''}</span></div>
+          {monitor.latest && monitor.latest.flags.length > 0 && <small className="blocked-text">标记：{monitor.latest.flags.map(flag => flagLabel[flag] ?? flag).join(' / ')}</small>}
+        </div>)}
+      </section>
+      <section className="panel"><div className="panel-head"><div><div className="eyebrow">THRESHOLD & DEVICE / 阈值与设备</div><h2>告警阈值（按作业阶段）</h2></div></div>
+        {reefer.thresholds.map(rule => <div className="threshold-row" key={rule.stage}>
+          <b>{stageLabel[rule.stage] ?? rule.stage}</b>
+          <label>告警 ±<input type="number" step="0.1" min="0.1" value={thresholdDraft[rule.stage]?.warnDelta ?? String(rule.warnDelta)} onChange={event => setThresholdDraft({ ...thresholdDraft, [rule.stage]: { warnDelta: event.target.value, critDelta: thresholdDraft[rule.stage]?.critDelta ?? String(rule.critDelta) } })}/></label>
+          <label>严重 ±<input type="number" step="0.1" min="0.1" value={thresholdDraft[rule.stage]?.critDelta ?? String(rule.critDelta)} onChange={event => setThresholdDraft({ ...thresholdDraft, [rule.stage]: { warnDelta: thresholdDraft[rule.stage]?.warnDelta ?? String(rule.warnDelta), critDelta: event.target.value } })}/></label>
+          <button onClick={() => void saveThreshold(rule.stage)}>保存</button>
+        </div>)}
+        <p className="muted form-hint">保鲜货（设定高于 -5°C）按 0.8 系数自动收紧；保存后立即重估活跃告警级别，但恢复闭环仍须等待新的正常采样。</p>
+        <div className="panel-head device-head"><h3>监测设备</h3><span className="muted">心跳中断 10 分钟判离线</span></div>
+        {reefer.devices.map(device => <div className="equipment" key={device.id}><i className={`equip-dot ${device.offline?'offline':''}`}/><div><b>{device.name}</b><small>{device.id} · 覆盖 {device.blockId} · 最后心跳 {time(device.lastSeenAt)}</small></div><strong className={device.offline?'critical':''}>{device.offline?'离线':'在线'}</strong></div>)}
+      </section>
+      <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">MANUAL HANDLING / 人工处置</div><h2>人工处置记录</h2></div><span className="muted">{reefer.handlingRecords.length} 条</span></div>
+        {reefer.handlingRecords.length === 0 && <p className="muted">暂无人工处置记录；高优先级告警可在此登记现场处置措施。</p>}
+        {reefer.handlingRecords.map(record => <div className="handling" key={record.id}><b>{record.id}</b><span>{record.containerId} · 告警 {record.alarmId}</span><p>{record.action}</p><small>{record.actor} · {time(record.at)} · {record.result}</small></div>)}
+      </section>
+    </div>}
     {tab === 'containers' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">CONTAINER REGISTER / CRUD</div><h2>箱务台账</h2><span className="muted">新增、查询、编辑、删除；危险品与冷藏箱受堆场约束校验</span></div><button className="primary-action" onClick={() => openCreate('container')}>＋ 新增箱务</button></div><div className="table container-table"><div className="tr th"><span>箱号 / 航次</span><span>尺寸 / 流向</span><span>箱况 / 海关</span><span>堆位</span><span>重量 / 属性</span><span>操作</span></div>{containers.map(container => <div className="tr" key={container.id}><span><b>{container.id}</b><small>{container.voyageId} · {container.lastEvent}</small></span><span>{container.size}ft · {container.direction}<small>{container.isoType}</small></span><span><b>{container.status}</b><small>海关：{container.customs}</small></span><span>{container.yardSlot}</span><span>{container.weightT}t<small>{container.reefer?`冷藏 ${container.temperature}°C`:container.hazmatClass?`危险品 ${container.hazmatClass} 类`:'普通箱'}</small></span><span className="row-actions"><button onClick={() => openEdit('container', container.id, { ...container, weightT: String(container.weightT), temperature: String(container.temperature ?? 4), hazmatClass: container.hazmatClass ?? '' })}>编辑</button><button className="danger-action" onClick={() => void remove('container', container.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'gate' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">GATE APPOINTMENT / SLOT CONTROL</div><h2>闸口预约与车道状态</h2><span className="muted">支持新增预约、编辑时隙、签到/完成和删除</span></div><button className="primary-action" onClick={() => openCreate('appointment')}>＋ 新增预约</button></div>{conflicts.map(conflict => <div className="conflict" key={`${conflict.appointmentId}-${conflict.reason}`}><strong>{conflict.severity}</strong><b>{conflict.appointmentId}</b><span>{conflict.reason}</span></div>)}<div className="table"><div className="tr th"><span>预约</span><span>箱号 / 车辆</span><span>窗口</span><span>车道</span><span>状态</span><span>操作</span></div>{appointments.map(appointment => <div className="tr" key={appointment.id}><span><b>{appointment.id}</b><small>{appointment.type}</small></span><span><b>{appointment.containerId}</b><small>{appointment.truckNo} · {appointment.driver}</small></span><span>{time(appointment.windowStart)}—{time(appointment.windowEnd)}</span><span>{appointment.lane}</span><span className={`pill ${appointment.status}`}>{appointment.status}</span><span className="row-actions">{appointment.status==='booked'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'checked-in')}>签到</button>:appointment.status==='checked-in'?<button onClick={() => void updateAppointmentStatus(appointment.id, 'completed')}>完成</button>:null}<button onClick={() => openEdit('appointment', appointment.id, { ...appointment, windowStart: toLocalInput(appointment.windowStart), windowEnd: toLocalInput(appointment.windowEnd) })}>编辑</button><button className="danger-action" onClick={() => void remove('appointment', appointment.id)}>删除</button></span></div>)}</div></section>}
     {tab === 'yard' && <section className="panel wide"><div className="panel-head"><div><div className="eyebrow">YARD HEATMAP / STACK DENSITY</div><h2>堆场容量与安全约束</h2></div><span className="muted">实时区块压力</span></div><div className="yard-grid">{blocks.map(block => <div className={`block ${block.pressure}`} key={block.id}><div className="block-top"><b>{block.id}</b><strong>{pct(block.utilization)}</strong></div><span>{block.zone}</span><div className="heat"><i style={{ width: `${block.heat / maxHeat * 100}%` }}/></div><div className="block-stats"><span>空位 {block.freeSlots}</span><span>冷插 {block.usedPlugs}/{block.reeferPlugs}</span><span>{block.hazmatAllowed?'危险品可入':'普通区'}</span></div></div>)}</div><div className="yard-note"><span>堆位推荐会同时考虑容量、热区、危险品隔离、冷藏插座和设备可达性。</span><b>A01 → C03 重排建议可释放 21 个低热度堆位</b></div></section>}
